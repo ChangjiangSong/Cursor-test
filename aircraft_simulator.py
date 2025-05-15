@@ -70,15 +70,31 @@ class AircraftSimulator:
         """获取光电数据"""
         return self.eo_data
         
-    def start_mission(self):
-        """开始任务模拟"""
+    def start_mission(self, force=False):
+        """
+        开始任务模拟
+        
+        Args:
+            force (bool): 当为True时，即使SAR航线未设置也强制启动
+        """
         if self._running:
             print("任务模拟已在运行中")
             return
             
-        if not self.sar_route:
+        if not self.sar_route and not force:
             print("错误: SAR航线尚未设置，无法开始任务")
+            print("提示: 如需强制启动，请使用force=True参数")
             return
+            
+        if not self.sar_route and force:
+            print("警告: SAR航线尚未设置，但以强制模式启动")
+            # 设置默认SAR航线
+            self.sar_route = {
+                "waypoints": "默认航线点",
+                "altitude": 3000,
+                "speed": 150,
+                "description": "默认生成的SAR航线"
+            }
             
         self._running = True
         self._simulation_thread = threading.Thread(target=self._run_simulation)
