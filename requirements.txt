@@ -1,5 +1,5 @@
 langchain>=0.1.0
-langgraph>=0.0.20
+langgraph>=0.0.27
 langchain-core>=0.1.10
 langchain-community>=0.0.13 
 langchain-deepseek>=0.0.1
