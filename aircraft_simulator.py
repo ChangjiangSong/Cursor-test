@@ -91,7 +91,7 @@ class AircraftSimulator:
             # 设置默认SAR航线
             self.sar_route = {
                 "waypoints": "默认航线点",
-                "altitude": 3000,
+                "altitude": 3000, 
                 "speed": 150,
                 "description": "默认生成的SAR航线"
             }
