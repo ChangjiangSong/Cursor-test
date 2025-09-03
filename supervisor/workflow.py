@@ -5,6 +5,8 @@ from typing import Dict, List, Any, Tuple, Literal
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langsmith.run_helpers import traceable
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
 
 from models import llm
 from config import SUPERVISOR_PROMPT
@@ -13,11 +15,19 @@ from aircraft_simulator import AircraftStatus, simulator
 from agents.planning_agents import SARPlanningAgent, EOPlanningAgent, SARPlanningInput, EOPlanningInput
 from agents.processing_agents import SARProcessingAgent, EOProcessingAgent, SARProcessingInput, EOProcessingInput
 
+# 创建InMemorySaver实例用于工作流状态保存
+checkpointer = InMemorySaver()
+
 # 创建Agent实例
 sar_planning_agent = SARPlanningAgent()
 eo_planning_agent = EOPlanningAgent()
 sar_processing_agent = SARProcessingAgent()
 eo_processing_agent = EOProcessingAgent()
+
+# 用于临时存储数据的全局变量
+sar_temp_route = None
+sar_temp_targets = None
+eo_temp_route = None
 
 @traceable(run_type="llm")
 def analyze_task(state: SupervisorState) -> SupervisorState:
@@ -258,7 +268,7 @@ def plan_sar_route(state: SupervisorState) -> SupervisorState:
     
     # 创建SAR规划输入
     planning_input = SARPlanningInput(
-        task="规划SAR区域侦查航线",
+        task="规划目标区域的SAR侦查航线",
         context={
             "target_area": target_area,
             "aircraft_status": state["aircraft_status"]
@@ -269,30 +279,102 @@ def plan_sar_route(state: SupervisorState) -> SupervisorState:
     planning_output = sar_planning_agent.process(planning_input)
     
     # 添加规划结果到消息中
-    prompt = f"SAR航线规划结果: {planning_output.result}"
-    messages.append(HumanMessage(content=prompt))
-    messages.append(AIMessage(content="收到SAR航线规划结果，航线已设置。"))
+    planning_result = f"""
+    SAR航线规划结果:
     
-    # 模拟人在回路确认
-    prompt = "请确认SAR航线是否满足要求？(是/否)"
-    messages.append(HumanMessage(content=prompt))
-    messages.append(AIMessage(content="是，航线满足任务要求。"))
+    航线描述: {planning_output.result}
+    
+    航线点:
+    {planning_output.route.waypoints if planning_output.route else "无航线点"}
+    
+    高度: {planning_output.route.altitude if planning_output.route else "未指定"} 米
+    速度: {planning_output.route.speed if planning_output.route else "未指定"} 米/秒
+    """
+    
+    messages.append(HumanMessage(content=planning_result))
+    
+    # 将路由信息保存在全局状态中供后续使用
+    global sar_temp_route
+    sar_temp_route = planning_output.route.dict() if planning_output.route else None
+    
+    # 添加人在回路交互：使用interrupt暂停执行并等待人工确认
+    interrupt_msg = f"SAR航线规划已完成，请审核以下航线是否满足任务要求:\n\n{planning_result}\n\n请选择: 'accept' 接受航线, 'edit' 修改航线"
+    return interrupt(interrupt_msg)
+    
+    # 以下代码会在用户响应后由main.py中的处理逻辑继续执行
+    # 处理人工交互结果将在工作流重新运行时处理
+
+@traceable(run_type="chain")
+def _continue_sar_route(state: SupervisorState, response: Dict) -> SupervisorState:
+    """继续SAR航线规划流程(在用户交互后)"""
+    messages = state["messages"]
+    execution_plan = state["execution_plan"]
+    current_step = state["current_step"]
+    
+    # 获取当前步骤
+    step = execution_plan[current_step - 1]
+    
+    # 获取临时存储的航线数据
+    global sar_temp_route
+    
+    # 如果没有临时存储的数据，使用plan_sar_route函数中的规划结果
+    if not sar_temp_route:
+        # 创建SAR规划输入
+        planning_input = SARPlanningInput(
+            task="规划目标区域的SAR侦查航线",
+            context={
+                "target_area": state["target_area"],
+                "aircraft_status": state["aircraft_status"]
+            }
+        )
+        
+        # 调用SAR规划Agent
+        planning_output = sar_planning_agent.process(planning_input)
+        
+        # 使用规划结果
+        if planning_output.route:
+            sar_temp_route = planning_output.route.dict()
+    
+    # 处理人工交互结果
+    if response["type"] == "accept":
+        # 用户接受航线，继续执行
+        messages.append(AIMessage(content="SAR航线已被接受，继续执行任务。"))
+    elif response["type"] == "edit":
+        # 用户要求修改航线
+        # 在实际应用中，这里应该处理用户的修改意见并重新规划航线
+        messages.append(HumanMessage(content=f"航线修改请求：{response.get('args', {}).get('feedback', '未提供具体修改意见')}"))
+        messages.append(AIMessage(content="已接收航线修改请求，正在重新规划。"))
+        
+        # 这里可以添加航线修改逻辑，例如：
+        # 1. 重新调用SAR规划Agent
+        # 2. 或直接修改航线参数
+        
+        # 简化示例：假设接收了新的航线数据
+        if "route_data" in response.get("args", {}):
+            sar_temp_route = response["args"]["route_data"]
+    else:
+        # 未知响应类型
+        messages.append(AIMessage(content=f"收到未知响应类型: {response['type']}，默认接受航线继续执行。"))
     
     # 更新步骤状态
     step.status = "已完成"
-    step.results = {"route": planning_output.route.dict()} if planning_output.route else {}
+    step.results = {"route": sar_temp_route if sar_temp_route else {}}
     execution_plan[current_step - 1] = step
     
     # 设置SAR航线到模拟器
-    if planning_output.route:
-        simulator.set_sar_route(planning_output.route.dict())
+    if sar_temp_route:
+        simulator.set_sar_route(sar_temp_route)
+    
+    # 清理临时变量
+    route_data = sar_temp_route
+    sar_temp_route = None
     
     # 更新状态
     return {
         **state,
         "messages": messages,
         "execution_plan": execution_plan,
-        "sar_route": planning_output.route.dict() if planning_output.route else None,
+        "sar_route": route_data,  # 确保返回SAR航线
         "next_node": "状态监控"
     }
 
@@ -322,22 +404,92 @@ def process_sar_data(state: SupervisorState) -> SupervisorState:
     # 调用SAR处理Agent
     processing_output = sar_processing_agent.process(processing_input)
     
+    # 格式化处理结果
+    targets_info = "\n".join([
+        f"- 目标 {target.target_id}: 置信度 {target.confidence:.2f}, 坐标 ({target.coordinates.lat:.4f}, {target.coordinates.lon:.4f})"
+        for target in processing_output.targets
+    ])
+    
+    processing_result = f"""
+    SAR数据处理结果:
+    
+    总结: {processing_output.result}
+    
+    检测到的目标数量: {len(processing_output.targets)}
+    
+    目标列表:
+    {targets_info}
+    """
+    
     # 添加处理结果到消息中
-    prompt = f"SAR数据处理结果: {processing_output.result}"
-    messages.append(HumanMessage(content=prompt))
-    messages.append(AIMessage(content="SAR数据处理完成，已识别目标。"))
+    messages.append(HumanMessage(content=processing_result))
+    
+    # 将目标存储在全局变量中，以便后续处理
+    global sar_temp_targets
+    sar_temp_targets = [target.dict() for target in processing_output.targets]
+    
+    # 添加人在回路交互：使用interrupt暂停执行并等待人工确认
+    interrupt_msg = f"SAR数据处理已完成，请审核以下检测结果:\n\n{processing_result}\n\n请选择: 'accept' 接受检测结果, 'filter' 过滤目标, 'add' 添加漏检目标"
+    
+    return interrupt(interrupt_msg)
+
+@traceable(run_type="chain")
+def _continue_sar_processing(state: SupervisorState, response: Dict) -> SupervisorState:
+    """继续SAR数据处理流程(在用户交互后)"""
+    messages = state["messages"]
+    execution_plan = state["execution_plan"]
+    current_step = state["current_step"]
+    
+    # 获取当前步骤
+    step = execution_plan[current_step - 1]
+    
+    # 从全局变量中获取临时存储的目标
+    global sar_temp_targets
+    targets = sar_temp_targets if sar_temp_targets else []
+    
+    # 处理人工交互结果
+    if response["type"] == "accept":
+        # 用户接受检测结果，继续执行
+        messages.append(AIMessage(content="SAR检测结果已被接受，继续执行任务。"))
+    elif response["type"] == "filter":
+        # 用户要求过滤目标
+        filter_ids = response.get("args", {}).get("filter_ids", [])
+        messages.append(HumanMessage(content=f"目标过滤请求：移除目标 {filter_ids}"))
+        
+        # 过滤目标
+        if filter_ids:
+            targets = [target for target in targets if target.get("target_id") not in filter_ids]
+            messages.append(AIMessage(content=f"已过滤指定目标，剩余 {len(targets)} 个目标。"))
+    elif response["type"] == "add":
+        # 用户要求添加漏检目标
+        new_targets = response.get("args", {}).get("new_targets", [])
+        messages.append(HumanMessage(content=f"添加漏检目标请求：添加 {len(new_targets)} 个目标"))
+        
+        # 添加新目标
+        if new_targets:
+            # 在实际应用中需要转换为正确的目标对象
+            # 这里简化处理
+            targets.extend(new_targets)
+            messages.append(AIMessage(content=f"已添加指定目标，现有 {len(targets)} 个目标。"))
+    else:
+        # 未知响应类型
+        messages.append(AIMessage(content=f"收到未知响应类型: {response['type']}，默认接受检测结果继续执行。"))
     
     # 更新步骤状态
     step.status = "已完成"
-    step.results = {"targets": [target.dict() for target in processing_output.targets]}
+    step.results = {"targets": targets}
     execution_plan[current_step - 1] = step
+    
+    # 清理临时变量
+    targets_data = targets
+    sar_temp_targets = None
     
     # 更新状态
     return {
         **state,
         "messages": messages,
         "execution_plan": execution_plan,
-        "sar_targets": [target.dict() for target in processing_output.targets],
+        "sar_targets": targets_data,
         "next_node": "状态监控"
     }
 
@@ -365,30 +517,91 @@ def plan_eo_route(state: SupervisorState) -> SupervisorState:
     planning_output = eo_planning_agent.process(planning_input)
     
     # 添加规划结果到消息中
-    prompt = f"光电航线规划结果: {planning_output.result}"
-    messages.append(HumanMessage(content=prompt))
-    messages.append(AIMessage(content="收到光电航线规划结果，航线已设置。"))
+    planning_result = f"""
+    光电航线规划结果:
     
-    # 模拟人在回路确认
-    prompt = "请确认光电航线是否满足要求？(是/否)"
-    messages.append(HumanMessage(content=prompt))
-    messages.append(AIMessage(content="是，航线满足任务要求。"))
+    航线描述: {planning_output.result}
+    
+    目标侦察点:
+    {planning_output.route.waypoints if planning_output.route else "无航线点"}
+    
+    高度: {planning_output.route.altitude if planning_output.route else "未指定"} 米
+    速度: {planning_output.route.speed if planning_output.route else "未指定"} 米/秒
+    """
+    
+    messages.append(HumanMessage(content=planning_result))
+    
+    # 存储路由信息到全局变量
+    global eo_temp_route
+    eo_temp_route = planning_output.route.dict() if planning_output.route else None
+    
+    # 添加人在回路交互：使用interrupt暂停执行并等待人工确认
+    interrupt_msg = (
+        f"光电航线规划已完成，基于SAR探测到的目标生成了光电跟踪航线。请审核以下航线是否满足任务要求:\n\n{planning_result}\n\n"
+        f"SAR已识别目标: {len(sar_targets)} 个\n\n"
+        f"请选择: 'accept' 接受航线, 'edit' 修改航线, 'prioritize' 调整目标优先级"
+    )
+    
+    return interrupt(interrupt_msg)
+
+@traceable(run_type="chain")
+def _continue_eo_route(state: SupervisorState, response: Dict) -> SupervisorState:
+    """继续光电航线规划流程(在用户交互后)"""
+    messages = state["messages"]
+    execution_plan = state["execution_plan"]
+    current_step = state["current_step"]
+    
+    # 获取当前步骤
+    step = execution_plan[current_step - 1]
+    
+    # 获取临时存储的路由
+    global eo_temp_route
+    eo_route = eo_temp_route
+    
+    # 处理人工交互结果
+    if response["type"] == "accept":
+        # 用户接受航线，继续执行
+        messages.append(AIMessage(content="光电航线已被接受，继续执行任务。"))
+    elif response["type"] == "edit":
+        # 用户要求修改航线
+        messages.append(HumanMessage(content=f"航线修改请求：{response.get('args', {}).get('feedback', '未提供具体修改意见')}"))
+        messages.append(AIMessage(content="已接收光电航线修改请求，正在调整。"))
+        
+        # 这里可以添加航线修改逻辑
+        if "route_data" in response.get("args", {}):
+            eo_route = response["args"]["route_data"]
+    elif response["type"] == "prioritize":
+        # 用户要求调整目标优先级
+        priority_targets = response.get("args", {}).get("priority_targets", [])
+        messages.append(HumanMessage(content=f"目标优先级调整请求：优先处理目标 {priority_targets}"))
+        messages.append(AIMessage(content="已接收目标优先级调整请求，正在重新规划光电航线。"))
+        
+        # 这里可以添加基于优先级的航线重规划逻辑
+        # 简化示例：假设我们记录了优先级信息
+        step.results["priority_targets"] = priority_targets
+    else:
+        # 未知响应类型
+        messages.append(AIMessage(content=f"收到未知响应类型: {response['type']}，默认接受航线继续执行。"))
     
     # 更新步骤状态
     step.status = "已完成"
-    step.results = {"route": planning_output.route.dict() if planning_output.route else {}}
+    step.results = {**step.results, "route": eo_route if eo_route else {}}
     execution_plan[current_step - 1] = step
     
     # 设置光电航线到模拟器
-    if planning_output.route:
-        simulator.set_eo_route(planning_output.route.dict())
+    if eo_route:
+        simulator.set_eo_route(eo_route)
+    
+    # 清理临时变量
+    route_data = eo_route
+    eo_temp_route = None
     
     # 更新状态
     return {
         **state,
         "messages": messages,
         "execution_plan": execution_plan,
-        "eo_route": planning_output.route.dict() if planning_output.route else None,
+        "eo_route": route_data,
         "next_node": "状态监控"
     }
 
@@ -445,6 +658,7 @@ def router(state: SupervisorState) -> Literal[
 
 def build_supervisor_workflow() -> StateGraph:
     """构建Supervisor工作流图"""
+    # 创建工作流图
     workflow = StateGraph(SupervisorState)
     
     # 添加节点
@@ -456,12 +670,17 @@ def build_supervisor_workflow() -> StateGraph:
     workflow.add_node("规划光电航线", plan_eo_route)
     workflow.add_node("处理光电数据", process_eo_data)
     
+    # 添加人在回路处理节点
+    workflow.add_node("继续SAR航线", _continue_sar_route)
+    workflow.add_node("继续SAR处理", _continue_sar_processing)
+    workflow.add_node("继续光电航线", _continue_eo_route)
+    
     # 设置入口点
     workflow.set_entry_point("分析任务")
     
     # 添加条件边
-    # 修复错误：不使用空字符串作为源节点，而是将路由器附加到所有节点
-    for node in ["分析任务", "规划执行", "状态监控", "规划SAR航线", "处理SAR数据", "规划光电航线", "处理光电数据"]:
+    for node in ["分析任务", "规划执行", "状态监控", "处理光电数据",
+                "继续SAR航线", "继续SAR处理", "继续光电航线"]:
         workflow.add_conditional_edges(
             node,
             router,
@@ -477,8 +696,15 @@ def build_supervisor_workflow() -> StateGraph:
             }
         )
     
+    # 添加人在回路边缘连接
+    workflow.add_edge("规划SAR航线", "继续SAR航线")
+    workflow.add_edge("处理SAR数据", "继续SAR处理")
+    workflow.add_edge("规划光电航线", "继续光电航线")
+    
     return workflow
 
 # 创建supervisor工作流图
 supervisor_workflow = build_supervisor_workflow()
-supervisor_app = supervisor_workflow.compile() 
+
+# 编译工作流，将checkpointer作为参数传入
+supervisor_app = supervisor_workflow.compile(checkpointer=checkpointer) 
