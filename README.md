@@ -93,3 +93,20 @@ python main.py
 3. 增加更多类型的载荷和Agent
 4. 增强决策能力和异常处理
 5. 优化Agent间协作机制 
+## 数据分析平台（新增）
+
+新增 `data_analysis_platform.py`，用于本地启动一个可视化数据分析页面：
+
+- 支持上传 `CSV / Excel`
+- 自动展示数据概览（行列数、缺失值、字段类型）
+- 支持以时间为 X 轴、多参数为 Y 轴的折线图绘制
+- 支持列名修改、批量删除行列、表格内直接编辑
+- 支持导出编辑后的 CSV / Excel
+- 支持针对图表输入评论并在会话内展示
+
+运行方式：
+
+```bash
+pip install -r requirements.txt
+streamlit run data_analysis_platform.py
+```

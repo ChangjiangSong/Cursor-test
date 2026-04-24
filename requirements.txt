@@ -5,3 +5,8 @@ langchain-community>=0.0.13
 langchain-deepseek>=0.0.1
 langsmith>=0.0.77
 python-dotenv>=1.0.0
+
+streamlit>=1.35.0
+pandas>=2.2.0
+plotly>=5.22.0
+openpyxl>=3.1.0
